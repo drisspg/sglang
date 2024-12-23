@@ -230,7 +230,7 @@ def extend(reqs, model_runner):
     )
 
     compile_linears(model_runner.model.model.layers)
-    # torch.compiler.cudagraph.mark_step_begin()
+    torch.compiler.cudagraph_mark_step_begin()
     batch.prepare_for_extend()
     model_worker_batch = batch.get_model_worker_batch()
     forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
