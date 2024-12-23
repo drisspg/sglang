@@ -66,6 +66,9 @@ from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import configure_logger, kill_process_tree, suppress_other_loggers
 
 
+from transformer_nuggets.utils.benchmark import profiler
+from pathlib import Path
+
 @dataclasses.dataclass
 class BenchArgs:
     run_name: str = "default"
@@ -204,6 +207,16 @@ def prepare_synthetic_inputs_for_latency_test(batch_size, input_len):
 
     return reqs
 
+def compile_linears(module):
+    for name, child in module.named_children():
+        if isinstance(child, torch.nn.Linear):
+            new_child = torch.compile(child, mode="reduce-overhead")
+            setattr(module, name, new_child)
+        else:
+            # Recursively process child modules
+            compile_linears(child)
+
+
 
 @torch.no_grad
 def extend(reqs, model_runner):
@@ -215,9 +228,13 @@ def extend(reqs, model_runner):
         model_config=model_runner.model_config,
         enable_overlap=False,
     )
+
+    compile_linears(model_runner.model.model.layers)
+    # torch.compiler.cudagraph.mark_step_begin()
     batch.prepare_for_extend()
     model_worker_batch = batch.get_model_worker_batch()
     forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
+    
     logits_output = model_runner.forward(forward_batch)
     next_token_ids = model_runner.sample(logits_output, forward_batch)
     return next_token_ids, logits_output.next_token_logits, batch
@@ -320,38 +337,38 @@ def latency_test_run_once(
     measurement_results["prefill_latency"] = prefill_latency
     measurement_results["prefill_throughput"] = throughput
 
-    # Decode
-    decode_latencies = []
-    for i in range(output_len - 1):
-        synchronize(device)
-        tic = time.time()
-        next_token_ids, _ = decode(next_token_ids, batch, model_runner)
-        synchronize(device)
-        latency = time.time() - tic
-        tot_latency += latency
-        throughput = batch_size / latency
-        decode_latencies.append(latency)
-        if i < 5:
-            rank_print(
-                f"Decode.  latency: {latency:6.5f} s, throughput: {throughput:9.2f} token/s"
-            )
+    # # Decode
+    # decode_latencies = []
+    # for i in range(output_len - 1):
+    #     synchronize(device)
+    #     tic = time.time()
+    #     next_token_ids, _ = decode(next_token_ids, batch, model_runner)
+    #     synchronize(device)
+    #     latency = time.time() - tic
+    #     tot_latency += latency
+    #     throughput = batch_size / latency
+    #     decode_latencies.append(latency)
+    #     if i < 5:
+    #         rank_print(
+    #             f"Decode.  latency: {latency:6.5f} s, throughput: {throughput:9.2f} token/s"
+    #         )
 
-    # Record decode timing from 2nd output
-    if output_len > 1:
-        med_decode_latency = np.median(decode_latencies)
-        med_decode_throughput = batch_size / med_decode_latency
-        rank_print(
-            f"Decode.  median latency: {med_decode_latency:6.5f} s, median throughput: {med_decode_throughput:9.2f} token/s"
-        )
-        measurement_results["median_decode_latency"] = med_decode_latency
-        measurement_results["median_decode_throughput"] = med_decode_throughput
+    # # Record decode timing from 2nd output
+    # if output_len > 1:
+    #     med_decode_latency = np.median(decode_latencies)
+    #     med_decode_throughput = batch_size / med_decode_latency
+    #     rank_print(
+    #         f"Decode.  median latency: {med_decode_latency:6.5f} s, median throughput: {med_decode_throughput:9.2f} token/s"
+    #     )
+    #     measurement_results["median_decode_latency"] = med_decode_latency
+    #     measurement_results["median_decode_throughput"] = med_decode_throughput
 
-    throughput = (input_len + output_len) * batch_size / tot_latency
-    rank_print(
-        f"Total. latency: {tot_latency:6.3f} s, throughput: {throughput:9.2f} token/s"
-    )
-    measurement_results["total_latency"] = tot_latency
-    measurement_results["overall_throughput"] = throughput
+    # throughput = (input_len + output_len) * batch_size / tot_latency
+    # rank_print(
+    #     f"Total. latency: {tot_latency:6.3f} s, throughput: {throughput:9.2f} token/s"
+    # )
+    # measurement_results["total_latency"] = tot_latency
+    # measurement_results["overall_throughput"] = throughput
     return measurement_results
 
 
@@ -385,39 +402,27 @@ def latency_test(
         8,  # shorter decoding to speed up the warmup
         server_args.device,
     )
-
-    try:
-        import os
-        import pwd
-
-        from gemlite.core import GemLiteLinearTriton
-
-        GemLiteLinearTriton.cache_config(
-            f"/tmp/{pwd.getpwuid(os.getuid()).pw_gecos}_gemlite.json"
-        )
-    except ImportError:
-        pass
-
     rank_print("Benchmark ...")
 
     # Run the sweep
-    result_list = []
-    for bs, il, ol in itertools.product(
-        bench_args.batch_size, bench_args.input_len, bench_args.output_len
-    ):
-        reqs = prepare_synthetic_inputs_for_latency_test(bs, il)
-        ret = latency_test_run_once(
-            bench_args.run_name,
-            model_runner,
-            rank_print,
-            reqs,
-            bs,
-            il,
-            ol,
-            server_args.device,
-        )
-        if ret is not None:
-            result_list.append(ret)
+    with profiler(Path("fp8_dq_profile.json"), with_stack=True):
+        result_list = []
+        for bs, il, ol in itertools.product(
+            bench_args.batch_size, bench_args.input_len, bench_args.output_len
+        ):
+            reqs = prepare_synthetic_inputs_for_latency_test(bs, il)
+            ret = latency_test_run_once(
+                bench_args.run_name,
+                model_runner,
+                rank_print,
+                reqs,
+                bs,
+                il,
+                ol,
+                server_args.device,
+            )
+            if ret is not None:
+                result_list.append(ret)
 
     # Write results in jsonlines format on rank 0.
     if tp_rank == 0 and bench_args.result_filename:
