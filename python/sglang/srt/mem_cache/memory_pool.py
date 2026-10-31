@@ -59,6 +59,7 @@ from sglang.srt.configs.mamba_utils import BaseLinearStateParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
+from sglang.srt.layers.attention.first_layer_vocab_kv import uses_vocab_kv
 from sglang.srt.layers.dcp.layout import maybe_dcp_kernel_indices
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     UnquantizedKVCacheMethod,
@@ -2201,6 +2202,12 @@ class MHATokenToKVPool(KVCache, MHAKVView):
         )
         self.post_capture_active = post_capture_active
         self._post_capture_owner = None
+        # Layer 0 served from vocabulary tables keeps one token id per slot instead of K/V.
+        self.first_layer_slot_tokens = (
+            torch.zeros(self.size + page_size, dtype=torch.int32, device=device)
+            if uses_vocab_kv(self.start_layer)
+            else None
+        )
         self.head_num = swa_head_num if swa_head_num is not None else head_num
         self.head_dim = swa_head_dim if swa_head_dim is not None else head_dim
         self.v_head_dim = (
@@ -2610,9 +2617,20 @@ class MHATokenToKVPool(KVCache, MHAKVView):
                         padded = (
                             rows if self.use_hnd else ceil_align(rows, self.page_size)
                         )
+                        # A vocab-KV layer only needs a placeholder page.
                         fused = [
-                            _zeros((2, padded, *k_shape[1:]))
-                            for _ in range(self.layer_num)
+                            _zeros(
+                                (
+                                    2,
+                                    (
+                                        self.page_size
+                                        if uses_vocab_kv(self.start_layer + layer)
+                                        else padded
+                                    ),
+                                    *k_shape[1:],
+                                )
+                            )
+                            for layer in range(self.layer_num)
                         ]
                         self.k_buffer = [buf[0, :rows] for buf in fused]
                         self.v_buffer = [buf[1, :rows] for buf in fused]
@@ -2636,8 +2654,10 @@ class MHATokenToKVPool(KVCache, MHAKVView):
         # e.g. vectorized_5d); fall back to _kv_buffer_shapes for the pre-allocation
         # post-capture call, which only runs for NHD/HND.
         if self.k_buffer and self.v_buffer:
-            k_shape = tuple(self.k_buffer[0].shape)
-            v_shape = tuple(self.v_buffer[0].shape)
+            # The last layer is never a vocab-KV placeholder (pipeline parallelism is
+            # rejected when the feature is on).
+            k_shape = tuple(self.k_buffer[-1].shape)
+            v_shape = tuple(self.v_buffer[-1].shape)
         else:
             k_shape, v_shape = self._kv_buffer_shapes()
         num_slots = self.size + self.page_size
@@ -3294,6 +3314,13 @@ class MHATokenToKVPool(KVCache, MHAKVView):
         size_limit = self.size + self.page_size
         maybe_detect_oob(tgt_loc, 0, size_limit, "move_kv_cache tgt_loc")
         maybe_detect_oob(src_loc, 0, size_limit, "move_kv_cache src_loc")
+
+        if self.first_layer_slot_tokens is not None:
+            # Layer 0 has only a placeholder buffer: move its token ids, not its rows.
+            slot_tokens = self.first_layer_slot_tokens
+            slot_tokens[tgt_loc] = slot_tokens[src_loc]
+            move_kv_cache_native(self.k_buffer[1:], self.v_buffer[1:], tgt_loc, src_loc)
+            return
 
         if self.use_hnd:
             pages_t, offs_t = tgt_loc // self.page_size, tgt_loc % self.page_size

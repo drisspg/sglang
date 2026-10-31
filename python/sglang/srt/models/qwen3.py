@@ -7,6 +7,10 @@ from torch import nn
 
 from sglang.kernels.ops.attention.table_qk_norm_rope import table_qk_norm_rope_
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.first_layer_vocab_kv import (
+    FirstLayerVocabKV,
+    uses_vocab_kv,
+)
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.layer_boundary import (
     append_stages,
@@ -30,7 +34,11 @@ from sglang.srt.model_executor.cuda_graph_config import (
     check_cuda_graph_backend,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.model_executor.forward_context import get_kv_layers
+from sglang.srt.model_executor.forward_context import (
+    get_kv_layers,
+    get_req_to_token_pool,
+    get_token_to_kv_pool,
+)
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
@@ -252,6 +260,13 @@ class Qwen3Attention(nn.Module):
             prefix=add_prefix("attn", prefix),
         )
         self.alt_stream = alt_stream
+        self.vocab_kv = (
+            FirstLayerVocabKV(
+                self.num_heads, self.num_kv_heads, self.head_dim, self.scaling
+            )
+            if uses_vocab_kv(layer_id)
+            else None
+        )
 
         # Qwen3 guarantees matching norm eps and full-head NeoX RoPE; these
         # CUDA head sizes also select the non-fallback RoPE implementation.
@@ -384,6 +399,20 @@ class Qwen3Attention(nn.Module):
     ) -> torch.Tensor:
         if get_exec().deterministic.rl_on_policy_target is not None:
             hidden_states = hidden_states.bfloat16()
+
+        if self.vocab_kv is not None:
+            q, _, _ = self.forward_prepare_native(
+                positions, hidden_states, forward_batch
+            )
+            attn_output = self.vocab_kv.forward(
+                q,
+                self.rotary_emb.cos_sin_cache,
+                forward_batch,
+                get_req_to_token_pool().req_to_token,
+                get_token_to_kv_pool().first_layer_slot_tokens,
+            )
+            output, _ = self.o_proj(attn_output)
+            return output
 
         save_kv_cache = True
         use_aiter_fused = False
@@ -787,6 +816,34 @@ class Qwen3ForCausalLM(nn.Module):
                     weight_loader(param, loaded_weight)
                 else:
                     logger.warning(f"Parameter {name} not found in params_dict")
+        self.build_first_layer_vocab_kv()
+
+    @torch.no_grad()
+    def build_first_layer_vocab_kv(self):
+        """(Re)build layer-0 vocabulary K/V tables from the current weights."""
+        if not uses_vocab_kv(getattr(self.model, "start_layer", 0)):
+            return
+        layer = self.model.layers[0]
+        attn = layer.self_attn
+
+        def project_kv(ids):
+            u = layer.input_layernorm(self.model.embed_tokens(ids))
+            qkv, _ = attn.qkv_proj(u)
+            q, k, v = qkv.split([attn.q_size, attn.kv_size, attn.kv_size], dim=-1)
+            _, k = apply_qk_norm(
+                q=q, k=k, q_norm=attn.q_norm, k_norm=attn.k_norm, head_dim=attn.head_dim
+            )
+            return k, v
+
+        attn.vocab_kv.build(
+            project_kv,
+            self.config.vocab_size,
+            self.model.embed_tokens.weight.device,
+        )
+        logger.info(
+            "Built first-layer vocab K/V tables: %.1f MiB",
+            attn.vocab_kv.tables.nbytes() / 2**20,
+        )
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight

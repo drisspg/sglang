@@ -31,6 +31,10 @@ from sglang.srt.configs.model_config import (
     uses_minimax_m3_nvfp4_native_stack,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.first_layer_vocab_kv import (
+    check_first_layer_vocab_kv_model,
+    uses_vocab_kv,
+)
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     collect_sources_by_ratio,
@@ -236,7 +240,14 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         else:
             num_layers = kvc.layer_info.num_effective_layers
 
-        self._cell_size = self._compute_cell_size(kvc, num_layers)
+        check_first_layer_vocab_kv_model(
+            getattr(kvc.model_config.hf_config, "architectures", None)
+        )
+        if uses_vocab_kv(kvc.layer_info.start_layer) and num_layers > 0:
+            # Layer 0 K/V come from vocabulary tables; each slot keeps one int32 token id.
+            self._cell_size = self._compute_cell_size(kvc, num_layers - 1) + 4
+        else:
+            self._cell_size = self._compute_cell_size(kvc, num_layers)
         has_kv_on_another_pp_stage = (
             self._cell_size == 0
             and mambaish is not None
