@@ -349,6 +349,29 @@ class Qwen3Attention(nn.Module):
             q, k = self.rotary_emb(positions, q, k)
         return q, k, v
 
+    def forward_prepare_q_only(self, positions, hidden_states):
+        """Layer-0 vocab-KV path: K/V come from tables, so project, norm, and rotate only Q.
+
+        The leading q_size rows of the fused QKV weight are a contiguous view, so the
+        projection reads half the weight instead of all of it.
+        """
+        qkv = self.qkv_proj
+        bias = qkv.bias[: self.q_size] if qkv.bias is not None else None
+        q = torch.nn.functional.linear(hidden_states, qkv.weight[: self.q_size], bias)
+        # The fused QK-norm and RoPE ops take q and k together; a one-head scratch key
+        # stands in for K so Q keeps the same kernels as the full path.
+        scratch_k = q.new_zeros(q.shape[0], self.head_dim)
+        q, _ = apply_qk_norm(
+            q=q,
+            k=scratch_k,
+            q_norm=self.q_norm,
+            k_norm=self.k_norm,
+            head_dim=self.head_dim,
+            alt_stream=self.alt_stream,
+        )
+        q, _ = self.rotary_emb(positions, q, scratch_k)
+        return q
+
     def forward_prepare_npu(self, positions, hidden_states, forward_batch):
         qkv, _ = self.qkv_proj(hidden_states)
 
@@ -401,9 +424,7 @@ class Qwen3Attention(nn.Module):
             hidden_states = hidden_states.bfloat16()
 
         if self.vocab_kv is not None:
-            q, _, _ = self.forward_prepare_native(
-                positions, hidden_states, forward_batch
-            )
+            q = self.forward_prepare_q_only(positions, hidden_states)
             attn_output = self.vocab_kv.forward(
                 q,
                 self.rotary_emb.cos_sin_cache,
