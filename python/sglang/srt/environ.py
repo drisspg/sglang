@@ -622,6 +622,9 @@ class Envs:
     # Memory pools and KV-cache sizing
     # ===================================================================
     SGLANG_NATIVE_MOVE_KV_CACHE = EnvBool(False)
+    # Prototype: serve layer-0 attention K/V from vocabulary tables instead of the
+    # KV pool (Qwen3ForCausalLM only; see layers/attention/first_layer_vocab_kv.py).
+    SGLANG_FIRST_LAYER_VOCAB_KV = EnvBool(False)
     # Disable lazy compaction in the unified memory pool allocator and
     # fall back to the per-free eager compaction. Used for production
     # A/B and quick rollback. Default False (lazy compaction on).
