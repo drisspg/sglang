@@ -11,7 +11,7 @@ from sglang.srt.models.unlimited_ocr_v2_support import document_prefetch as p
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-small")
 
 
 def _encode(items):
